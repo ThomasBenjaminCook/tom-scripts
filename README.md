@@ -70,6 +70,8 @@ Type and run:
 
 Both commands open `pwsh` with `-NoExit`, so prompts stay interactive.
 
+Both scripts now prompt you to choose whether to open the selected target in **SSH** or **VS Code**. The launch mode requires an explicit choice each time.
+
 ## If It Does Not Show Up in PowerToys Run
 
 Restart PowerToys Run (or sign out and sign back in) so it picks up updated PATH entries.

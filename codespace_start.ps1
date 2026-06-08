@@ -486,6 +486,31 @@ function Select-CodespaceAction {
     }
 }
 
+function Select-ConnectionMode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetName
+    )
+
+    while ($true) {
+        Write-Host "`nHow do you want to open '$TargetName'?"
+        Write-Host '  1. SSH'
+        Write-Host '  2. VS Code'
+        Write-Host '  Q. Quit'
+
+        $selection = Read-Host "`nSelect connection mode"
+        if ($selection -match '^[Qq]$') {
+            exit 0
+        }
+
+        switch ($selection) {
+            '1' { return 'SSH' }
+            '2' { return 'VSCode' }
+            default { Write-Host 'Invalid selection.' }
+        }
+    }
+}
+
 function Get-AvailableMachines {
     param(
         [Parameter(Mandatory = $true)]
@@ -569,6 +594,8 @@ function Open-CodespaceInVsCode {
         [string]$CodespaceName
     )
 
+    Test-RequiredCommand -Name 'code' -InstallHint "Install Visual Studio Code and ensure the 'code' command is on PATH."
+
     Write-Host "`nOpening VS Code in codespace '$CodespaceName'..."
     & gh codespace code -c $CodespaceName
     if ($LASTEXITCODE -ne 0) {
@@ -576,8 +603,22 @@ function Open-CodespaceInVsCode {
     }
 }
 
+function Open-CodespaceInSsh {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CodespaceName
+    )
+
+    Test-RequiredCommand -Name 'ssh' -InstallHint "Install OpenSSH Client and ensure the 'ssh' command is on PATH."
+
+    Write-Host "`nOpening SSH session in codespace '$CodespaceName'..."
+    & gh codespace ssh -c $CodespaceName
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Failed to open an SSH session for codespace '$CodespaceName'."
+    }
+}
+
 Test-RequiredCommand -Name 'gh' -InstallHint 'Install GitHub CLI from https://cli.github.com/'
-Test-RequiredCommand -Name 'code' -InstallHint "Install Visual Studio Code and ensure the 'code' command is on PATH."
 Test-GhCodespaceScope
 
 $repositoryOwners = Get-RepositoryOwnersFromEnvironment
@@ -601,4 +642,9 @@ $codespaceName = if ($codespaceAction.Action -eq 'Open') {
     New-RepositoryCodespace -RepositoryFullName $selectedRepository.nameWithOwner -MachineName $selectedMachine.name
 }
 
-Open-CodespaceInVsCode -CodespaceName $codespaceName
+$connectionMode = Select-ConnectionMode -TargetName $codespaceName
+if ($connectionMode -eq 'SSH') {
+    Open-CodespaceInSsh -CodespaceName $codespaceName
+} else {
+    Open-CodespaceInVsCode -CodespaceName $codespaceName
+}

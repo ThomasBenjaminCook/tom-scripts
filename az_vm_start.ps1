@@ -6,6 +6,108 @@ if (-not (Get-Module -ListAvailable -Name Az.Compute)) {
     exit 1
 }
 
+function Test-RequiredCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InstallHint
+    )
+
+    if (-not (Get-Command -Name $Name -ErrorAction SilentlyContinue)) {
+        Write-Error "$Name was not found. $InstallHint"
+        exit 1
+    }
+}
+
+function Select-ConnectionMode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetName
+    )
+
+    while ($true) {
+        Write-Host "`nHow do you want to open '$TargetName'?"
+        Write-Host '  1. SSH'
+        Write-Host '  2. VS Code'
+        Write-Host '  Q. Quit'
+
+        $selection = Read-Host "`nSelect connection mode"
+        switch -Regex ($selection) {
+            '^[Qq]$' { exit 0 }
+            '^1$' { return 'SSH' }
+            '^2$' { return 'VSCode' }
+            default { Write-Host 'Invalid selection.' }
+        }
+    }
+}
+
+function Get-VmSshConnectionDetails {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VmName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VmIp
+    )
+
+    $connectionDetails = [ordered]@{
+        Host = $VmIp
+        HostName = $VmIp
+        User = $null
+        HasConfigMatch = $false
+    }
+
+    $sshConfigPath = "$env:USERPROFILE\.ssh\config"
+    if (-not (Test-Path $sshConfigPath)) {
+        return [pscustomobject]$connectionDetails
+    }
+
+    $configLines = Get-Content $sshConfigPath
+    $currentBlock = $null
+    foreach ($line in ($configLines + @('Host __END__'))) {
+        if ($line -match '^\s*Host\s+(.+)$') {
+            if ($currentBlock) {
+                $hostPatterns = @($currentBlock.Host -split '\s+' | Where-Object { $_ })
+                $matchesVmIp = -not [string]::IsNullOrWhiteSpace($currentBlock.HostName) -and $currentBlock.HostName -eq $VmIp
+                $matchesVmName = $hostPatterns -contains $VmName
+                if ($matchesVmIp -or $matchesVmName) {
+                    $connectionDetails.Host = if ($hostPatterns.Count -gt 0) { $hostPatterns[0] } else { $VmIp }
+                    if (-not [string]::IsNullOrWhiteSpace($currentBlock.HostName)) {
+                        $connectionDetails.HostName = $currentBlock.HostName
+                    }
+                    $connectionDetails.User = $currentBlock.User
+                    $connectionDetails.HasConfigMatch = $true
+                    break
+                }
+            }
+
+            $currentBlock = [ordered]@{
+                Host = $Matches[1].Trim()
+                HostName = $null
+                User = $null
+            }
+            continue
+        }
+
+        if (-not $currentBlock) {
+            continue
+        }
+
+        if ($line -match '^\s*HostName\s+(.+)$') {
+            $currentBlock.HostName = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match '^\s*User\s+(.+)$') {
+            $currentBlock.User = $Matches[1].Trim()
+        }
+    }
+
+    return [pscustomobject]$connectionDetails
+}
+
 # Connect if not already
 $context = Get-AzContext
 if (-not $context) {
@@ -56,73 +158,78 @@ Write-Host "`nStarting VM '$vmName'... (this may take a minute)"
 $result = Start-AzVM -ResourceGroupName $rgName -Name $vmName
 Write-Host "Done! Status: $($result.Status)"
 
-# Offer to open VS Code with Remote SSH
-$openVSCode = Read-Host "`nOpen VS Code with Remote SSH for '$vmName'? (y/n)"
-if ($openVSCode -match '^[Yy]') {
+# Resolve the VM's public IP address
+$vmDetails = Get-AzVM -ResourceGroupName $rgName -Name $vmName
+$nicId = $vmDetails.NetworkProfile.NetworkInterfaces[0].Id
+$nic = Get-AzNetworkInterface -ResourceId $nicId
+$pipConfig = $nic.IpConfigurations[0].PublicIpAddress
+if (-not $pipConfig) {
+    Write-Error "No public IP address is associated with '$vmName'. Cannot open an SSH or VS Code session."
+    exit 1
+}
 
-    # Resolve the VM's public IP address
-    $vmDetails = Get-AzVM -ResourceGroupName $rgName -Name $vmName
-    $nicId = $vmDetails.NetworkProfile.NetworkInterfaces[0].Id
-    $nic = Get-AzNetworkInterface -ResourceId $nicId
-    $pipConfig = $nic.IpConfigurations[0].PublicIpAddress
-    if (-not $pipConfig) {
-        Write-Error "No public IP address is associated with '$vmName'. Cannot open Remote SSH."
+# Parse resource group and name from the resource ID
+$pipIdParts = $pipConfig.Id -split '/'
+$pipRg = $pipIdParts[$pipIdParts.IndexOf('resourceGroups') + 1]
+$pipName = $pipIdParts[-1]
+$pip = Get-AzPublicIpAddress -ResourceGroupName $pipRg -Name $pipName
+$vmIp = $pip.IpAddress
+if ([string]::IsNullOrWhiteSpace($vmIp) -or $vmIp -eq 'None') {
+    Write-Error "Public IP address for '$vmName' is not yet assigned. Try again in a moment."
+    exit 1
+}
+
+Write-Host "VM public IP: $vmIp"
+
+$sshConnection = Get-VmSshConnectionDetails -VmName $vmName -VmIp $vmIp
+if ($sshConnection.HasConfigMatch) {
+    if ([string]::IsNullOrWhiteSpace($sshConnection.User)) {
+        Write-Host "Found SSH config entry - using host '$($sshConnection.Host)'"
     } else {
-        # Parse resource group and name from the resource ID
-        $pipIdParts = $pipConfig.Id -split '/'
-        $pipRg   = $pipIdParts[$pipIdParts.IndexOf('resourceGroups') + 1]
-        $pipName = $pipIdParts[-1]
-        $pip = Get-AzPublicIpAddress -ResourceGroupName $pipRg -Name $pipName
-        $vmIp = $pip.IpAddress
-        if ([string]::IsNullOrWhiteSpace($vmIp) -or $vmIp -eq 'None') {
-            Write-Error "Public IP address for '$vmName' is not yet assigned. Try again in a moment."
-        } else {
-            Write-Host "VM public IP: $vmIp"
-
-            # Try to find a matching entry in ~/.ssh/config by Host alias or HostName
-            $sshConfigPath = "$env:USERPROFILE\.ssh\config"
-            $sshUser = $null
-            $sshHost = $vmIp  # default to IP for VS Code URI
-            if (Test-Path $sshConfigPath) {
-                $configLines = Get-Content $sshConfigPath
-                $inBlock = $false
-                $blockHost = $null
-                $blockHostName = $null
-                $blockUser = $null
-                foreach ($line in ($configLines + @('Host __END__'))) {
-                    if ($line -match '^\s*Host\s+(.+)$') {
-                        # Save previous block if it matched
-                        if ($inBlock -and $blockUser) {
-                            $matchIp   = $blockHostName -and ($blockHostName -eq $vmIp)
-                            $matchName = $blockHost -and ($blockHost -eq $vmName)
-                            if ($matchIp -or $matchName) {
-                                $sshUser = $blockUser
-                                if ($blockHost) { $sshHost = $blockHost }
-                                break
-                            }
-                        }
-                        $blockHost = $Matches[1].Trim()
-                        $blockHostName = $null
-                        $blockUser = $null
-                        $inBlock = $true
-                    } elseif ($inBlock) {
-                        if ($line -match '^\s*HostName\s+(.+)$') { $blockHostName = $Matches[1].Trim() }
-                        if ($line -match '^\s*User\s+(.+)$')     { $blockUser     = $Matches[1].Trim() }
-                    }
-                }
-            }
-
-            if ($sshUser) {
-                Write-Host "Found SSH config entry - using User '$sshUser' via host '$sshHost'"
-            } else {
-                $sshUser = Read-Host "Enter SSH username"
-            }
-            $remotePath = Read-Host "Enter remote path to open (leave blank for /home/$sshUser)"
-            if ([string]::IsNullOrWhiteSpace($remotePath)) { $remotePath = "/home/$sshUser" }
-
-            $remoteUri = "vscode-remote://ssh-remote+$sshUser@$sshHost$remotePath"
-            Write-Host "`nLaunching VS Code -> $remoteUri"
-            code --folder-uri $remoteUri
-        }
+        Write-Host "Found SSH config entry - using user '$($sshConnection.User)' via host '$($sshConnection.Host)'"
     }
 }
+
+$connectionMode = Select-ConnectionMode -TargetName $vmName
+if ($connectionMode -eq 'SSH') {
+    Test-RequiredCommand -Name 'ssh' -InstallHint "Install OpenSSH Client and ensure the 'ssh' command is on PATH."
+
+    if ($sshConnection.HasConfigMatch) {
+        Write-Host "`nOpening SSH session to '$vmName' via '$($sshConnection.Host)'..."
+        & ssh $sshConnection.Host
+    } else {
+        $sshUser = Read-Host "Enter SSH username"
+        if ([string]::IsNullOrWhiteSpace($sshUser)) {
+            Write-Error 'SSH username is required.'
+            exit 1
+        }
+
+        Write-Host "`nOpening SSH session to '$sshUser@$vmIp'..."
+        & ssh "$sshUser@$vmIp"
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "SSH exited with code $LASTEXITCODE."
+        exit $LASTEXITCODE
+    }
+
+    exit 0
+}
+
+Test-RequiredCommand -Name 'code' -InstallHint "Install Visual Studio Code and ensure the 'code' command is on PATH."
+
+$sshUser = $sshConnection.User
+if ([string]::IsNullOrWhiteSpace($sshUser)) {
+    $sshUser = Read-Host "Enter SSH username"
+    if ([string]::IsNullOrWhiteSpace($sshUser)) {
+        Write-Error 'SSH username is required to open VS Code Remote SSH.'
+        exit 1
+    }
+}
+
+$remotePath = Read-Host "Enter remote path to open (leave blank for /home/$sshUser)"
+if ([string]::IsNullOrWhiteSpace($remotePath)) { $remotePath = "/home/$sshUser" }
+
+$remoteUri = "vscode-remote://ssh-remote+$sshUser@$($sshConnection.Host)$remotePath"
+Write-Host "`nLaunching VS Code -> $remoteUri"
+code --folder-uri $remoteUri
