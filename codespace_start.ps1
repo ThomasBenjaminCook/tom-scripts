@@ -9,6 +9,8 @@ $RepositoryFetchLimit = 1000
 $RepositoryDisplayLimit = 10
 $FzfCommandName = 'fzf'
 $FzfInstallHint = 'Install fzf with: winget install --id junegunn.fzf --source winget'
+$CodespaceReadyTimeoutSeconds = 600
+$CodespacePollIntervalSeconds = 5
 
 function Fail {
     param(
@@ -79,6 +81,111 @@ function Invoke-GhJson {
     }
 
     return $output | ConvertFrom-Json
+}
+
+function Get-PropertyValue {
+    param(
+        [AllowNull()]
+        [object]$Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName,
+
+        [AllowNull()]
+        [object]$DefaultValue = $null
+    )
+
+    if ($null -eq $Object) {
+        return $DefaultValue
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($PropertyName)) {
+            return $Object[$PropertyName]
+        }
+
+        return $DefaultValue
+    }
+
+    $property = $Object.PSObject.Properties[$PropertyName]
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Get-Codespace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CodespaceName
+    )
+
+    return Invoke-GhJson -Arguments @(
+        'api', "user/codespaces/$CodespaceName"
+    ) -FailureMessage "Failed to get details for codespace '$CodespaceName'."
+}
+
+function Start-Codespace {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CodespaceName
+    )
+
+    $null = Invoke-GhText -Arguments @(
+        'api', '--method', 'POST', "user/codespaces/$CodespaceName/start"
+    ) -FailureMessage "Failed to start codespace '$CodespaceName'."
+}
+
+function Wait-CodespaceReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CodespaceName,
+
+        [int]$TimeoutSeconds = $CodespaceReadyTimeoutSeconds,
+        [int]$PollIntervalSeconds = $CodespacePollIntervalSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastState = $null
+    $lastPendingOperation = $null
+    $startRequested = $false
+
+    while ((Get-Date) -lt $deadline) {
+        $codespace = Get-Codespace -CodespaceName $CodespaceName
+        if ($null -eq $codespace) {
+            Fail "Codespace '$CodespaceName' could not be found."
+        }
+
+        $state = [string]$codespace.state
+        $pendingOperation = [bool]$codespace.pending_operation
+
+        if ($state -eq 'Available') {
+            return
+        }
+
+        if ($state -eq 'Shutdown' -and -not $startRequested) {
+            Write-Host "Starting codespace '$CodespaceName'..."
+            Start-Codespace -CodespaceName $CodespaceName
+            $startRequested = $true
+        }
+
+        if ($state -eq 'Deleted') {
+            Fail "Codespace '$CodespaceName' is deleted and cannot be opened."
+        }
+
+        if ($state -ne $lastState -or $pendingOperation -ne $lastPendingOperation) {
+            $pendingSuffix = if ($pendingOperation) { ' (pending operation)' } else { '' }
+            Write-Host "Waiting for codespace '$CodespaceName' to be ready (state: $state$pendingSuffix)..."
+            $lastState = $state
+            $lastPendingOperation = $pendingOperation
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    $codespace = Get-Codespace -CodespaceName $CodespaceName
+    Fail "Codespace '$CodespaceName' did not become ready within $TimeoutSeconds seconds. Last reported state: $($codespace.state)."
 }
 
 function Get-LocalTimestamp {
@@ -418,6 +525,10 @@ function Get-RepositoryCodespaces {
         'api', "repos/$RepositoryFullName/codespaces"
     ) -FailureMessage "Failed to list codespaces for $RepositoryFullName."
 
+    if ($null -eq $response -or $null -eq $response.codespaces) {
+        return @()
+    }
+
     return @($response.codespaces)
 }
 
@@ -439,18 +550,26 @@ function Select-CodespaceAction {
         } else {
             for ($i = 0; $i -lt $codespaceList.Count; $i++) {
                 $codespace = $codespaceList[$i]
-                $displayName = if ([string]::IsNullOrWhiteSpace($codespace.display_name)) { $codespace.name } else { $codespace.display_name }
-                $machineName = if ($codespace.machine) {
-                    if ([string]::IsNullOrWhiteSpace($codespace.machine.display_name)) {
-                        $codespace.machine.name
-                    } else {
-                        $codespace.machine.display_name
-                    }
+                $codespaceName = [string](Get-PropertyValue -Object $codespace -PropertyName 'name')
+                $codespaceDisplayName = [string](Get-PropertyValue -Object $codespace -PropertyName 'display_name')
+                $displayName = if ([string]::IsNullOrWhiteSpace($codespaceDisplayName)) {
+                    if ([string]::IsNullOrWhiteSpace($codespaceName)) { 'unnamed codespace' } else { $codespaceName }
                 } else {
-                    'unknown machine'
+                    $codespaceDisplayName
                 }
-                $lastUsed = Get-LocalTimestamp -Timestamp $codespace.last_used_at
-                Write-Host ("  {0}. {1} [{2}] | {3} | last used {4}" -f ($i + 1), $displayName, $codespace.state, $machineName, $lastUsed)
+
+                $machine = Get-PropertyValue -Object $codespace -PropertyName 'machine'
+                $machineDisplayName = [string](Get-PropertyValue -Object $machine -PropertyName 'display_name')
+                $machineCode = [string](Get-PropertyValue -Object $machine -PropertyName 'name')
+                $machineName = if ([string]::IsNullOrWhiteSpace($machineDisplayName)) {
+                    if ([string]::IsNullOrWhiteSpace($machineCode)) { 'unknown machine' } else { $machineCode }
+                } else {
+                    $machineDisplayName
+                }
+
+                $state = [string](Get-PropertyValue -Object $codespace -PropertyName 'state' -DefaultValue 'unknown state')
+                $lastUsed = Get-LocalTimestamp -Timestamp ([string](Get-PropertyValue -Object $codespace -PropertyName 'last_used_at'))
+                Write-Host ("  {0}. {1} [{2}] | {3} | last used {4}" -f ($i + 1), $displayName, $state, $machineName, $lastUsed)
             }
         }
 
@@ -521,7 +640,12 @@ function Get-AvailableMachines {
         'api', "repos/$RepositoryFullName/codespaces/machines"
     ) -FailureMessage "Failed to list machine types for $RepositoryFullName."
 
-    $machines = @($response.machines)
+    $machines = if ($null -eq $response -or $null -eq $response.machines) {
+        @()
+    } else {
+        @($response.machines)
+    }
+
     if ($machines.Count -eq 0) {
         Fail "No machine types were returned for $RepositoryFullName."
     }
@@ -539,8 +663,16 @@ function Select-MachineType {
         Write-Host "`nAvailable machine types:"
         for ($i = 0; $i -lt $Machines.Count; $i++) {
             $machine = $Machines[$i]
-            $prebuild = if ([string]::IsNullOrWhiteSpace($machine.prebuild_availability)) { 'unknown' } else { $machine.prebuild_availability }
-            Write-Host ("  {0}. {1} ({2}) | prebuild: {3}" -f ($i + 1), $machine.name, $machine.display_name, $prebuild)
+            $machineName = [string](Get-PropertyValue -Object $machine -PropertyName 'name')
+            $machineDisplayName = [string](Get-PropertyValue -Object $machine -PropertyName 'display_name')
+            $displayName = if ([string]::IsNullOrWhiteSpace($machineDisplayName)) {
+                if ([string]::IsNullOrWhiteSpace($machineName)) { 'unknown machine' } else { $machineName }
+            } else {
+                $machineDisplayName
+            }
+            $prebuildValue = [string](Get-PropertyValue -Object $machine -PropertyName 'prebuild_availability')
+            $prebuild = if ([string]::IsNullOrWhiteSpace($prebuildValue)) { 'unknown' } else { $prebuildValue }
+            Write-Host ("  {0}. {1} ({2}) | prebuild: {3}" -f ($i + 1), $machineName, $displayName, $prebuild)
         }
         Write-Host '  Q. Quit'
 
@@ -643,6 +775,7 @@ $codespaceName = if ($codespaceAction.Action -eq 'Open') {
 }
 
 $connectionMode = Select-ConnectionMode -TargetName $codespaceName
+Wait-CodespaceReady -CodespaceName $codespaceName
 if ($connectionMode -eq 'SSH') {
     Open-CodespaceInSsh -CodespaceName $codespaceName
 } else {
