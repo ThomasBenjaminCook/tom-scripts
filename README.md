@@ -72,6 +72,8 @@ Both commands open `pwsh` with `-NoExit`, so prompts stay interactive.
 
 Both scripts now prompt you to choose whether to open the selected target in **SSH** or **VS Code**. The launch mode requires an explicit choice each time.
 
+`az_vm_start.ps1` can also create a temporary **Standard Azure Bastion** for SSH when no usable native-client Bastion is available, temporarily replace a reachable **Developer** Bastion and restore it during cleanup, prefer the VM VNet for `AzureBastionSubnet`, fall back to a reachable peered VNet if needed, and schedule the temporary Standard Bastion for deletion after a chosen number of hours.
+
 ## If It Does Not Show Up in PowerToys Run
 
 Restart PowerToys Run (or sign out and sign back in) so it picks up updated PATH entries.
